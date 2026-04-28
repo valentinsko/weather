@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meteum — агрегатор прогнозов погоды</title>
+<meta name="description" content="Сравнение прогнозов погоды из нескольких независимых моделей: ECMWF, ICON, GFS, Météo-France, GEM, JMA. С расчётом среднего." />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Albert+Sans:wght@300..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet" />
+
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◐</span>
+    <span class="brand-name">Meteum</span>
+    <span class="brand-tag">consensus weather</span>
+  </div>
+
+  <form class="search" id="search-form" autocomplete="off">
+    <input
+      type="text"
+      id="city-input"
+      placeholder="Город — Москва, Amsterdam, 東京…"
+      spellcheck="false"
+    />
+    <button type="submit" aria-label="Найти">→</button>
+    <ul id="suggest" class="suggest" hidden></ul>
+  </form>
+
+  <button class="settings-btn" id="settings-btn" aria-label="Настройки">⚙</button>
+</header>
+
+<main class="layout">
+
+  <!-- HERO: текущая локация и сводка -->
+  <section class="hero" id="hero">
+    <div class="hero-loc">
+      <h1 id="loc-name">—</h1>
+      <p id="loc-meta">выберите город, чтобы загрузить прогнозы</p>
+    </div>
+    <div class="hero-now" id="hero-now"></div>
+  </section>
+
+  <!-- ТЕКУЩАЯ ПОГОДА: сравнение источников -->
+  <section class="block">
+    <div class="block-head">
+      <h2>Сейчас <span class="block-sub">— сравнение источников</span></h2>
+      <p class="block-help">Каждая колонка — независимая метеомодель или сервис. «Среднее» — медиана по доступным значениям.</p>
+    </div>
+    <div class="table-scroll">
+      <table class="t" id="table-now"></table>
+    </div>
+  </section>
+
+  <!-- ПРОГНОЗ ПО ЧАСАМ -->
+  <section class="block">
+    <div class="block-head">
+      <h2>Прогноз по часам</h2>
+      <div class="param-tabs" id="hourly-tabs"></div>
+    </div>
+    <div class="table-scroll">
+      <table class="t" id="table-hourly"></table>
+    </div>
+  </section>
+
+  <!-- ПРОГНОЗ ПО ДНЯМ -->
+  <section class="block">
+    <div class="block-head">
+      <h2>Прогноз на 7 дней</h2>
+      <div class="param-tabs" id="daily-tabs"></div>
+    </div>
+    <div class="table-scroll">
+      <table class="t" id="table-daily"></table>
+    </div>
+  </section>
+
+  <!-- КАРТА ОСАДКОВ ЯНДЕКСА -->
+  <section class="block block--map">
+    <div class="block-head">
+      <h2>Карта движения осадков <span class="block-sub">— Яндекс Nowcast</span></h2>
+      <p class="block-help">Прогноз радара от Яндекса. Если виджет не загрузился — откроется по ссылке.</p>
+    </div>
+    <div class="map-wrap" id="map-wrap"></div>
+  </section>
+
+  <footer class="foot">
+    <p>
+      Источники: Open-Meteo (модели ECMWF, ICON-DWD, GFS, Météo-France, GEM, JMA),
+      OpenWeatherMap, WeatherAPI, MET Norway.
+      Карта осадков — yandex.ru/pogoda/maps/nowcast.
+    </p>
+    <p class="foot-mute">
+      Open source · MIT · <a href="https://github.com/" target="_blank" rel="noopener">github</a>
+    </p>
+  </footer>
+</main>
+
+<!-- ПАНЕЛЬ НАСТРОЕК -->
+<aside class="panel" id="panel" hidden>
+  <div class="panel-inner">
+    <div class="panel-head">
+      <h3>Настройки</h3>
+      <button class="panel-close" id="panel-close" aria-label="Закрыть">✕</button>
+    </div>
+
+    <div class="panel-section">
+      <h4>Источники без ключа</h4>
+      <p class="panel-help">Метеомодели через Open-Meteo. Включаются и работают сразу.</p>
+      <div id="model-toggles"></div>
+    </div>
+
+    <div class="panel-section">
+      <h4>Источники с ключом</h4>
+      <p class="panel-help">Ключи хранятся только в этом браузере (localStorage), на сервер не отправляются.</p>
+
+      <label class="key-row">
+        <span>OpenWeatherMap</span>
+        <input type="text" id="key-owm" placeholder="API key" />
+      </label>
+      <p class="panel-help-mute">Получить: <a href="https://openweathermap.org/api" target="_blank" rel="noopener">openweathermap.org</a> · 1M вызовов/мес бесплатно</p>
+
+      <label class="key-row">
+        <span>WeatherAPI.com</span>
+        <input type="text" id="key-wapi" placeholder="API key" />
+      </label>
+      <p class="panel-help-mute">Получить: <a href="https://www.weatherapi.com/" target="_blank" rel="noopener">weatherapi.com</a> · 1M вызовов/мес бесплатно</p>
+    </div>
+
+    <div class="panel-section">
+      <h4>Премиум-источники</h4>
+      <p class="panel-help">Эти сервисы требуют backend-прокси (CORS / JWT). См. README в репозитории — там описано, как добавить через Cloudflare Workers или Vercel Functions.</p>
+      <ul class="panel-list">
+        <li><strong>Google Weather API</strong> — Maps Platform, до 10k вызовов/мес бесплатно</li>
+        <li><strong>Яндекс.Погода</strong> — нужен бизнес-аккаунт в Yandex Cloud</li>
+        <li><strong>Apple WeatherKit</strong> — нужен Apple Developer ($99/год) и JWT-подписание</li>
+      </ul>
+    </div>
+
+    <div class="panel-section">
+      <h4>Единицы</h4>
+      <div class="seg" id="units-seg">
+        <button data-units="metric" class="active">°C · м/с · мм</button>
+        <button data-units="imperial">°F · mph · in</button>
+      </div>
+    </div>
+
+    <div class="panel-actions">
+      <button class="btn btn-primary" id="save-settings">Сохранить и обновить</button>
+    </div>
+  </div>
+</aside>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="providers.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
