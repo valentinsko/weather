@@ -9,18 +9,20 @@
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
   const PROVIDERS = window.METEUM_PROVIDERS;
-  const { circularMean } = window.METEUM_UTIL;
+  const { circularMean, severityRank } = window.METEUM_UTIL;
 
   // ---- state ------------------------------------------------------------
 
   const state = {
-    city: null,                 // { name, country, latitude, longitude, timezone }
-    units: 'metric',            // 'metric' | 'imperial'
-    enabledProviders: {},       // { providerId: true }
+    city: null,
+    units: 'metric',
+    enabledProviders: {},
     keys: { owm: '', wapi: '' },
-    activeHourlyParam: 'temp',
-    activeDailyParam: 'temp',
-    data: {},                   // { providerId: ProviderData | { error } }
+    activeHourlyParam: 'weather',
+    activeDailyParam: 'weather',
+    data: {},
+    rvMap: null,
+    rvLayer: null,
   };
 
   // ---- LS helpers -------------------------------------------------------
@@ -61,7 +63,7 @@
   function fmtWind(v) {
     if (v == null || isNaN(v)) return '—';
     if (state.units === 'imperial') return `${(v * 2.23694).toFixed(0)} mph`;
-    return `${v.toFixed(1)} m/s`;
+    return `${v.toFixed(1)} м/сек`;
   }
 
   function fmtPrec(v) {
@@ -71,9 +73,14 @@
     return `${v.toFixed(1)} мм`;
   }
 
+  // hPa → мм рт. ст. (1 hPa ≈ 0.7501 mmHg). В России традиционно мм рт. ст.
   function fmtPressure(v) {
     if (v == null || isNaN(v)) return '—';
-    return `${Math.round(v)} hPa`;
+    if (state.units === 'imperial') {
+      // inches of mercury
+      return `${(v * 0.02953).toFixed(2)} inHg`;
+    }
+    return `${Math.round(v * 0.750062)} мм рт. ст.`;
   }
 
   function fmtHumidity(v) {
@@ -88,7 +95,84 @@
     return `${dirs[idx]} ${Math.round(v)}°`;
   }
 
-  // ---- statistics: median is more robust than mean for ensemble averaging
+  // ---- weather labels & icons ------------------------------------------
+
+  const WEATHER_LABELS = {
+    clear:               { day: 'ясно',         night: 'ясно',        sym: ['☀','☾'] },
+    mostly_clear:        { day: 'малооблачно',  night: 'малооблачно', sym: ['🌤','🌙'] },
+    partly_cloudy:       { day: 'переменная облачность', night: 'переменная облачность', sym: ['⛅','☁'] },
+    cloudy:              { day: 'пасмурно',     night: 'пасмурно',    sym: ['☁','☁'] },
+    fog:                 { day: 'туман',        night: 'туман',       sym: ['🌫','🌫'] },
+    drizzle:             { day: 'морось',       night: 'морось',      sym: ['🌦','🌧'] },
+    freezing_drizzle:    { day: 'ледяная морось', night: 'ледяная морось', sym: ['🌧','🌧'] },
+    rain:                { day: 'дождь',        night: 'дождь',       sym: ['🌧','🌧'] },
+    rain_showers:        { day: 'ливень',       night: 'ливень',      sym: ['🌦','🌧'] },
+    freezing_rain:       { day: 'ледяной дождь', night: 'ледяной дождь', sym: ['🌧','🌧'] },
+    snow:                { day: 'снег',         night: 'снег',        sym: ['🌨','🌨'] },
+    snow_showers:        { day: 'снежные ливни', night: 'снежные ливни', sym: ['🌨','🌨'] },
+    sleet:               { day: 'мокрый снег',  night: 'мокрый снег', sym: ['🌨','🌨'] },
+    hail:                { day: 'град',         night: 'град',        sym: ['🌨','🌨'] },
+    thunderstorm:        { day: 'гроза',        night: 'гроза',       sym: ['⛈','⛈'] },
+    thunderstorm_hail:   { day: 'гроза с градом', night: 'гроза с градом', sym: ['⛈','⛈'] },
+    unknown:             { day: '—',            night: '—',           sym: ['','']},
+  };
+
+  const SEVERITY_PREFIX = {
+    light:    'небольш',     // согласование руками: «небольшой дождь / небольшая морось»
+    moderate: '',
+    heavy:    'сильн',
+  };
+
+  // словарь для согласования по роду
+  const WEATHER_GENDER = {
+    drizzle: 'f', freezing_drizzle: 'f', rain: 'm', rain_showers: 'm',
+    freezing_rain: 'm', snow: 'm', snow_showers: 'm', sleet: 'm', hail: 'm',
+    thunderstorm: 'f', thunderstorm_hail: 'f',
+  };
+
+  function weatherText(kind, severity, isDay) {
+    const lbl = WEATHER_LABELS[kind] || WEATHER_LABELS.unknown;
+    const base = isDay === false ? lbl.night : lbl.day;
+    if (!severity || severity === 'moderate') return base;
+    const stem = SEVERITY_PREFIX[severity];
+    if (!stem) return base;
+    const g = WEATHER_GENDER[kind];
+    let prefix;
+    if (g === 'f') prefix = stem + 'ая';
+    else if (g === 'm') prefix = stem + 'ий';
+    else return base;
+    return `${prefix} ${base}`;
+  }
+
+  function weatherIcon(kind, isDay) {
+    const lbl = WEATHER_LABELS[kind] || WEATHER_LABELS.unknown;
+    return isDay === false ? lbl.sym[1] : lbl.sym[0];
+  }
+
+  // отдельная иконка ночь/день — заменим солнечные на лунные
+  // Тут эмодзи ограничивают: ☀→☾, ⛅→🌙, 🌤→🌙, 🌦/🌧/🌨/⛈/🌫 — одинаково днём/ночью
+  function weatherIconV2(kind, isDay) {
+    if (isDay === false) {
+      const map = {
+        clear: '☾',
+        mostly_clear: '🌙',
+        partly_cloudy: '☁',
+        cloudy: '☁',
+      };
+      if (map[kind]) return map[kind];
+    } else {
+      const map = {
+        clear: '☀',
+        mostly_clear: '🌤',
+        partly_cloudy: '⛅',
+        cloudy: '☁',
+      };
+      if (map[kind]) return map[kind];
+    }
+    return weatherIcon(kind, isDay);
+  }
+
+  // ---- statistics: median for ensemble averaging ----
 
   function median(arr) {
     const xs = arr.filter(v => v != null && !isNaN(v)).sort((a, b) => a - b);
@@ -97,10 +181,17 @@
     return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
   }
 
-  function meanOf(arr) {
-    const xs = arr.filter(v => v != null && !isNaN(v));
+  // мода (самое частое значение) — для категориальных типа weather_kind
+  function mode(arr) {
+    const xs = arr.filter(Boolean);
     if (!xs.length) return null;
-    return xs.reduce((s, v) => s + v, 0) / xs.length;
+    const counts = {};
+    for (const v of xs) counts[v] = (counts[v] || 0) + 1;
+    let best = null, bestN = 0;
+    for (const k in counts) {
+      if (counts[k] > bestN) { bestN = counts[k]; best = k; }
+    }
+    return best;
   }
 
   // ---- toast ------------------------------------------------------------
@@ -224,13 +315,10 @@
     return PROVIDERS.filter(p => {
       if (state.enabledProviders[p.id] === false) return false;
       if (p.requiresKey) {
-        const key = state.keys[p.id === 'owm' ? 'owm' : p.id === 'wapi' ? 'wapi' : null];
-        if (!key) return false;
+        const k = p.id === 'owm' ? state.keys.owm : p.id === 'wapi' ? state.keys.wapi : null;
+        if (!k) return false;
       }
-      // По умолчанию включены все open-meteo, кроме `om_best` (он совпадает с одним из других)
-      if (state.enabledProviders[p.id] == null) {
-        return p.enabledByDefault;
-      }
+      if (state.enabledProviders[p.id] == null) return p.enabledByDefault;
       return true;
     });
   }
@@ -260,6 +348,16 @@
 
     renderHero();
     renderTables();
+    renderRadarNow();
+
+    // если ВСЕ источники отвалились — не оставляем немую пустоту
+    const okCount = providers.filter(p => state.data[p.id] && !state.data[p.id].error).length;
+    if (providers.length && okCount === 0) {
+      toast('Не удалось загрузить данные ни из одного источника. Возможно, временный сбой сети или превышен лимит запросов — попробуйте обновить через минуту.', 'error');
+    } else if (okCount < providers.length) {
+      const failed = providers.length - okCount;
+      console.warn(`${failed} из ${providers.length} источников не ответили`);
+    }
   }
 
   // ---- rendering: hero --------------------------------------------------
@@ -269,6 +367,7 @@
       $('#loc-name').innerHTML = '—';
       $('#loc-meta').textContent = 'выберите город, чтобы загрузить прогнозы';
       $('#hero-now').innerHTML = '';
+      document.body.classList.remove('is-night');
       return;
     }
 
@@ -279,11 +378,7 @@
     const providers = activeProviders();
     $('#loc-meta').textContent = `${c.latitude.toFixed(3)}, ${c.longitude.toFixed(3)} · ${providers.length} источник${suffix(providers.length, ['', 'а', 'ов'])}`;
 
-    // consensus current
-    const currents = providers
-      .map(p => state.data[p.id]?.current)
-      .filter(Boolean);
-
+    const currents = providers.map(p => state.data[p.id]?.current).filter(Boolean);
     if (!currents.length) {
       $('#hero-now').innerHTML = '<span class="skeleton" style="width:140px;height:64px;display:block;border-radius:8px;"></span>';
       return;
@@ -294,10 +389,22 @@
     const wind = median(currents.map(c => c.wind_speed));
     const dir  = circularMean(currents.map(c => c.wind_direction).filter(v => v != null));
     const press = median(currents.map(c => c.pressure));
+    const kindMode = mode(currents.map(c => c.weather_kind));
+    const sevMode = mode(currents.map(c => c.severity));
+    // is_day — мажоритарно
+    const dayVotes = currents.map(c => c.is_day).filter(v => v != null);
+    const isDay = dayVotes.length ? (dayVotes.filter(Boolean).length >= dayVotes.length / 2) : true;
+
+    document.body.classList.toggle('is-night', !isDay);
+
+    const phenom = weatherText(kindMode, sevMode, isDay);
+    const icon = weatherIconV2(kindMode, isDay);
 
     $('#hero-now').innerHTML = `
+      <div class="hero-icon">${icon}</div>
       <div class="big">${fmtTemp(tempAvg).replace('°','')}<sup>°</sup></div>
       <div class="small-stack">
+        <span class="phenom">${escapeHtml(phenom)}</span>
         <span>ощущается <b>${fmtTemp(feels)}</b></span>
         <span>ветер <b>${fmtWind(wind)}</b> · ${fmtDir(dir)}</span>
         <span>давление <b>${fmtPressure(press)}</b></span>
@@ -314,17 +421,32 @@
 
   // ---- rendering: tables ------------------------------------------------
 
-  const PARAMS = {
-    temp:        { label: 'Температура',      unit: '°',     get: o => o.temp,           fmt: fmtTemp,     useMedian: true },
-    feels_like:  { label: 'Ощущается как',    unit: '°',     get: o => o.feels_like,     fmt: fmtTemp,     useMedian: true },
-    pressure:    { label: 'Давление',         unit: 'hPa',   get: o => o.pressure,       fmt: fmtPressure, useMedian: true },
-    wind_speed:  { label: 'Скорость ветра',   unit: 'm/s',   get: o => o.wind_speed,     fmt: fmtWind,     useMedian: true },
-    wind_dir:    { label: 'Направление',      unit: '°',     get: o => o.wind_direction, fmt: fmtDir,      circular: true },
-    precipitation: { label: 'Осадки',         unit: 'мм',    get: o => o.precipitation,  fmt: fmtPrec,     useMedian: true },
-  };
+  const NOW_ROWS = [
+    { id: 'weather',     label: 'Явление',          unit: '' },
+    { id: 'temp',        label: 'Температура',      unit: '°' },
+    { id: 'feels_like',  label: 'Ощущается как',    unit: '°' },
+    { id: 'pressure',    label: 'Давление',         unit: 'мм рт. ст.' },
+    { id: 'wind_speed',  label: 'Скорость ветра',   unit: 'м/сек' },
+    { id: 'wind_dir',    label: 'Направление',      unit: '°' },
+    { id: 'precipitation', label: 'Осадки',         unit: 'мм' },
+  ];
 
-  const HOURLY_PARAMS = ['temp', 'feels_like', 'precipitation', 'wind_speed', 'pressure'];
-  const DAILY_PARAMS  = ['temp_max_min', 'feels_like_max_min', 'precipitation_sum', 'wind_speed_max'];
+  const HOURLY_TABS = [
+    { id: 'weather',       label: 'Явление' },
+    { id: 'temp',          label: 'Температура' },
+    { id: 'feels_like',    label: 'Ощущается' },
+    { id: 'precipitation', label: 'Осадки' },
+    { id: 'wind_speed',    label: 'Ветер' },
+    { id: 'pressure',      label: 'Давление' },
+  ];
+
+  const DAILY_TABS = [
+    { id: 'weather',            label: 'Явление дня' },
+    { id: 'temp_max_min',       label: 'Темп. (мин/макс)' },
+    { id: 'feels_like_max_min', label: 'Ощущается (мин/макс)' },
+    { id: 'precipitation_sum',  label: 'Сумма осадков' },
+    { id: 'wind_speed_max',     label: 'Макс. ветер' },
+  ];
 
   function renderLoadingTables() {
     ['#table-now', '#table-hourly', '#table-daily'].forEach(s => {
@@ -340,12 +462,10 @@
     renderDailyTable();
   }
 
-  // ---- NOW table: rows = parameters, cols = providers + mean ------------
+  // ---- NOW table --------------------------------------------------------
 
   function renderNowTable() {
     const providers = activeProviders().filter(p => state.data[p.id]?.current);
-    const rows = ['temp', 'feels_like', 'pressure', 'wind_speed', 'wind_dir', 'precipitation'];
-
     if (!providers.length) {
       $('#table-now').innerHTML = `<tbody><tr><td class="empty" colspan="9">Нет доступных источников. Откройте настройки и проверьте, какие провайдеры включены.</td></tr></tbody>`;
       return;
@@ -355,24 +475,15 @@
       `<th title="${escapeHtml(p.region)}">${escapeHtml(p.name)}</th>`
     ).join('');
 
-    const body = rows.map(rk => {
-      const param = PARAMS[rk];
+    const body = NOW_ROWS.map(row => {
       const cells = providers.map(p => {
-        const v = param.get(state.data[p.id].current);
-        return `<td>${param.fmt(v)}</td>`;
+        const cur = state.data[p.id].current;
+        return `<td>${formatNowCell(cur, row.id)}</td>`;
       });
-      // mean
-      let avg;
-      if (param.circular) {
-        const dirs = providers.map(p => state.data[p.id].current.wind_direction).filter(v => v != null);
-        avg = dirs.length ? circularMean(dirs) : null;
-      } else {
-        avg = median(providers.map(p => param.get(state.data[p.id].current)));
-      }
-      cells.push(`<td class="mean">${param.fmt(avg)}</td>`);
+      cells.push(`<td class="mean">${formatNowAvg(providers, row.id)}</td>`);
       return `
         <tr>
-          <td class="row-label">${param.label}<span class="unit">${param.unit}</span></td>
+          <td class="row-label">${row.label}${row.unit ? `<span class="unit">${row.unit}</span>` : ''}</td>
           ${cells.join('')}
         </tr>`;
     }).join('');
@@ -383,11 +494,54 @@
     `;
   }
 
-  // ---- HOURLY tabs + table ----------------------------------------------
+  function formatNowCell(cur, paramId) {
+    if (paramId === 'weather') {
+      const txt = weatherText(cur.weather_kind, cur.severity, cur.is_day);
+      const icon = weatherIconV2(cur.weather_kind, cur.is_day);
+      return `<span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span>`;
+    }
+    if (paramId === 'temp')         return fmtTemp(cur.temp);
+    if (paramId === 'feels_like')   return fmtTemp(cur.feels_like);
+    if (paramId === 'pressure')     return fmtPressure(cur.pressure);
+    if (paramId === 'wind_speed')   return fmtWind(cur.wind_speed);
+    if (paramId === 'wind_dir')     return fmtDir(cur.wind_direction);
+    if (paramId === 'precipitation') return fmtPrec(cur.precipitation);
+    return '—';
+  }
+
+  function formatNowAvg(providers, paramId) {
+    const currents = providers.map(p => state.data[p.id].current).filter(Boolean);
+    if (paramId === 'weather') {
+      const k = mode(currents.map(c => c.weather_kind));
+      const s = mode(currents.map(c => c.severity));
+      const dayVotes = currents.map(c => c.is_day).filter(v => v != null);
+      const isDay = dayVotes.length ? (dayVotes.filter(Boolean).length >= dayVotes.length / 2) : true;
+      const txt = weatherText(k, s, isDay);
+      const icon = weatherIconV2(k, isDay);
+      return `<span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span>`;
+    }
+    if (paramId === 'wind_dir') {
+      const dirs = currents.map(c => c.wind_direction).filter(v => v != null);
+      return fmtDir(dirs.length ? circularMean(dirs) : null);
+    }
+    const map = {
+      temp: c => c.temp, feels_like: c => c.feels_like,
+      pressure: c => c.pressure, wind_speed: c => c.wind_speed,
+      precipitation: c => c.precipitation,
+    };
+    const fmt = {
+      temp: fmtTemp, feels_like: fmtTemp,
+      pressure: fmtPressure, wind_speed: fmtWind,
+      precipitation: fmtPrec,
+    }[paramId];
+    return fmt(median(currents.map(map[paramId])));
+  }
+
+  // ---- HOURLY -----------------------------------------------------------
 
   function renderHourlyTabs() {
-    $('#hourly-tabs').innerHTML = HOURLY_PARAMS.map(p => `
-      <button data-param="${p}" class="${p === state.activeHourlyParam ? 'active' : ''}">${PARAMS[p].label}</button>
+    $('#hourly-tabs').innerHTML = HOURLY_TABS.map(t => `
+      <button data-param="${t.id}" class="${t.id === state.activeHourlyParam ? 'active' : ''}">${t.label}</button>
     `).join('');
     $$('#hourly-tabs button').forEach(b => {
       b.addEventListener('click', () => {
@@ -405,10 +559,6 @@
       return;
     }
 
-    const param = PARAMS[state.activeHourlyParam];
-
-    // Берём timeline из первого провайдера (open-meteo дают одинаковые шаги).
-    // Показываем 24 часа от ближайшего часа.
     const baseHourly = state.data[providers[0].id].hourly;
     const now = Date.now();
     let startIdx = baseHourly.findIndex(h => new Date(h.time).getTime() >= now - 30 * 60 * 1000);
@@ -424,30 +574,20 @@
       const isNow = hi === 0;
       const timeLabel = `<td class="row-label ${isNow ? 'col-now' : ''}">${formatHour(t)}</td>`;
 
-      const values = providers.map(p => {
-        // ищем точку в этом провайдере по времени (ближайшее)
+      // выберем для каждого провайдера ближайшую точку времени
+      const matched = providers.map(p => {
         const ph = state.data[p.id].hourly;
         const target = t.getTime();
         let best = null, bestDiff = Infinity;
         for (const pt of ph) {
           const d = Math.abs(new Date(pt.time).getTime() - target);
           if (d < bestDiff) { bestDiff = d; best = pt; }
-          if (d > 60 * 60 * 1000) continue;
         }
-        // допускаем расхождение до 90 минут
-        if (best && bestDiff <= 90 * 60 * 1000) return param.get(best);
-        return null;
+        return (best && bestDiff <= 90 * 60 * 1000) ? best : null;
       });
 
-      const cells = values.map(v => `<td class="${isNow ? 'col-now' : ''}">${param.fmt(v)}</td>`);
-      let avg;
-      if (param.circular) {
-        const dirs = values.filter(v => v != null);
-        avg = dirs.length ? circularMean(dirs) : null;
-      } else {
-        avg = median(values);
-      }
-      cells.push(`<td class="mean ${isNow ? 'col-now' : ''}">${param.fmt(avg)}</td>`);
+      const cells = matched.map(pt => `<td class="${isNow ? 'col-now' : ''}">${formatHourlyCell(pt, state.activeHourlyParam)}</td>`);
+      cells.push(`<td class="mean ${isNow ? 'col-now' : ''}">${formatHourlyAvg(matched, state.activeHourlyParam)}</td>`);
 
       return `<tr>${timeLabel}${cells.join('')}</tr>`;
     }).join('');
@@ -458,26 +598,63 @@
     `;
   }
 
+  function formatHourlyCell(pt, paramId) {
+    if (!pt) return '—';
+    if (paramId === 'weather') {
+      const txt = weatherText(pt.weather_kind, pt.severity, pt.is_day);
+      const icon = weatherIconV2(pt.weather_kind, pt.is_day);
+      return `<span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span>`;
+    }
+    if (paramId === 'temp')          return fmtTemp(pt.temp);
+    if (paramId === 'feels_like')    return fmtTemp(pt.feels_like);
+    if (paramId === 'pressure')      return fmtPressure(pt.pressure);
+    if (paramId === 'wind_speed')    return fmtWind(pt.wind_speed);
+    if (paramId === 'precipitation') return fmtPrec(pt.precipitation);
+    return '—';
+  }
+
+  function formatHourlyAvg(matched, paramId) {
+    const valid = matched.filter(Boolean);
+    if (!valid.length) return '—';
+    if (paramId === 'weather') {
+      const k = mode(valid.map(p => p.weather_kind));
+      const s = mode(valid.map(p => p.severity));
+      const dayVotes = valid.map(p => p.is_day).filter(v => v != null);
+      const isDay = dayVotes.length ? (dayVotes.filter(Boolean).length >= dayVotes.length / 2) : true;
+      const txt = weatherText(k, s, isDay);
+      const icon = weatherIconV2(k, isDay);
+      return `<span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span>`;
+    }
+    const get = {
+      temp: p => p.temp, feels_like: p => p.feels_like,
+      pressure: p => p.pressure, wind_speed: p => p.wind_speed,
+      precipitation: p => p.precipitation,
+    }[paramId];
+    const fmt = {
+      temp: fmtTemp, feels_like: fmtTemp,
+      pressure: fmtPressure, wind_speed: fmtWind,
+      precipitation: fmtPrec,
+    }[paramId];
+    return fmt(median(valid.map(get)));
+  }
+
   function formatHour(d) {
     const today = new Date();
     const dayLabel = (d.getDate() === today.getDate() && d.getMonth() === today.getMonth())
       ? 'сегодня'
-      : (d.getDate() === today.getDate() + 1 || (d.getDate() === 1 && today.getDate() > 27))
-        ? 'завтра'
-        : ['вс','пн','вт','ср','чт','пт','сб'][d.getDay()];
+      : (() => {
+          const tomorrow = new Date(today);
+          tomorrow.setDate(tomorrow.getDate() + 1);
+          if (d.getDate() === tomorrow.getDate() && d.getMonth() === tomorrow.getMonth()) return 'завтра';
+          return ['вс','пн','вт','ср','чт','пт','сб'][d.getDay()];
+        })();
     return `${dayLabel} ${String(d.getHours()).padStart(2, '0')}:00`;
   }
 
-  // ---- DAILY tabs + table -----------------------------------------------
+  // ---- DAILY ------------------------------------------------------------
 
   function renderDailyTabs() {
-    const tabs = [
-      { id: 'temp_max_min',       label: 'Температура (мин/макс)' },
-      { id: 'feels_like_max_min', label: 'Ощущается (мин/макс)' },
-      { id: 'precipitation_sum',  label: 'Сумма осадков' },
-      { id: 'wind_speed_max',     label: 'Макс. ветер' },
-    ];
-    $('#daily-tabs').innerHTML = tabs.map(t => `
+    $('#daily-tabs').innerHTML = DAILY_TABS.map(t => `
       <button data-param="${t.id}" class="${t.id === state.activeDailyParam ? 'active' : ''}">${t.label}</button>
     `).join('');
     $$('#daily-tabs button').forEach(b => {
@@ -503,6 +680,8 @@
       `<th title="${escapeHtml(p.region)}">${escapeHtml(p.name)}</th>`
     ).join('');
 
+    const k = state.activeDailyParam;
+
     const body = days.map((day) => {
       const dt = new Date(day.date);
       const dayLabel = `<td class="row-label">${formatDay(dt)}</td>`;
@@ -513,9 +692,21 @@
       });
 
       let cells, avgCell;
-      const k = state.activeDailyParam;
 
-      if (k === 'temp_max_min') {
+      if (k === 'weather') {
+        cells = values.map(d => {
+          if (!d) return '<td class="absent">—</td>';
+          const txt = weatherText(d.weather_kind, d.severity, true);
+          const icon = weatherIconV2(d.weather_kind, true);
+          return `<td><span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span></td>`;
+        });
+        const valid = values.filter(Boolean);
+        const avgK = mode(valid.map(d => d.weather_kind));
+        const avgS = mode(valid.map(d => d.severity));
+        const txt = weatherText(avgK, avgS, true);
+        const icon = weatherIconV2(avgK, true);
+        avgCell = `<td class="mean"><span class="phenom-cell"><span class="ph-ico">${icon}</span>${escapeHtml(txt)}</span></td>`;
+      } else if (k === 'temp_max_min') {
         cells = values.map(d => `<td>${d ? `${fmtTemp(d.temp_min)} / ${fmtTemp(d.temp_max)}` : '—'}</td>`);
         const avgMin = median(values.map(d => d?.temp_min));
         const avgMax = median(values.map(d => d?.temp_max));
@@ -531,7 +722,7 @@
       } else if (k === 'precipitation_sum') {
         cells = values.map(d => `<td>${d ? fmtPrec(d.precipitation_sum) : '—'}</td>`);
         avgCell = `<td class="mean">${fmtPrec(median(values.map(d => d?.precipitation_sum)))}</td>`;
-      } else { // wind_speed_max
+      } else {
         cells = values.map(d => `<td>${d ? fmtWind(d.wind_speed_max) : '—'}</td>`);
         avgCell = `<td class="mean">${fmtWind(median(values.map(d => d?.wind_speed_max)))}</td>`;
       }
@@ -555,29 +746,224 @@
     return `${prefix} <span style="color:var(--text-dim)">${d.getDate()} ${monthNames[d.getMonth()]}</span>`;
   }
 
-  // ---- Map: Windy iframe (с разноцветными слоями rain/wind/temp) --------
-  // Дополнительно — кнопка "Открыть Яндекс Nowcast" (надёжная ссылка).
+  // ---- MAP: RainViewer + Leaflet ---------------------------------------
+  // RainViewer бесплатный публичный API, без ключа, глобальное покрытие.
+  // https://www.rainviewer.com/api.html
 
-  function renderMap() {
+  // --- общий кэш индекса RainViewer (используется картой и точечным радаром) ---
+  let _rvCache = null;
+  async function getRainViewerIndex() {
+    if (_rvCache && (Date.now() - _rvCache.t) < 5 * 60 * 1000) return _rvCache.data;
+    const r = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+    if (!r.ok) throw new Error('rv index http');
+    const data = await r.json();
+    _rvCache = { t: Date.now(), data };
+    return data;
+  }
+
+  // широта/долгота → номер тайла (z) + пиксель внутри тайла (256px)
+  function latLonToTile(lat, lon, z) {
+    const n = 2 ** z;
+    const latRad = lat * Math.PI / 180;
+    const xf = (lon + 180) / 360 * n;
+    const yf = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n;
+    const x = Math.floor(xf), y = Math.floor(yf);
+    return {
+      x, y,
+      px: Math.min(255, Math.max(0, Math.floor((xf - x) * 256))),
+      py: Math.min(255, Math.max(0, Math.floor((yf - y) * 256))),
+    };
+  }
+
+  // Сэмплируем радарный тайл в точке города → есть ли осадки ПРЯМО СЕЙЧАС.
+  // Это наблюдение (радар+спутник), а не прогноз модели.
+  async function sampleRadar(lat, lon) {
+    const data = await getRainViewerIndex();
+    const past = data.radar?.past || [];
+    const frame = past[past.length - 1];      // самый свежий ИЗМЕРЕННЫЙ кадр
+    if (!frame) throw new Error('no radar frame');
+
+    const z = 7;
+    const { x, y, px, py } = latLonToTile(lat, lon, z);
+    // color scheme 4 (TWC) с чёткими ступенями, без сглаживания (_0)
+    const url = `${data.host}${frame.path}/256/${z}/${x}/${y}/4/1_0.png`;
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((res, rej) => {
+      img.onload = res;
+      img.onerror = () => rej(new Error('tile load failed'));
+      img.src = url;
+    });
+
+    const cv = document.createElement('canvas');
+    cv.width = 256; cv.height = 256;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+
+    // окрестность ±3px (радар патчевый, точка может попасть между пикселями)
+    let maxAlpha = 0, best = null;
+    const R = 3;
+    const x0 = Math.max(0, px - R), y0 = Math.max(0, py - R);
+    const w = Math.min(256, px + R + 1) - x0;
+    const h = Math.min(256, py + R + 1) - y0;
+    const region = ctx.getImageData(x0, y0, w, h).data;
+    for (let i = 0; i < region.length; i += 4) {
+      const a = region[i + 3];
+      if (a > maxAlpha) { maxAlpha = a; best = [region[i], region[i + 1], region[i + 2], a]; }
+    }
+
+    const precip = maxAlpha > 25;
+    let intensity = null;
+    if (precip && best) {
+      const [r, g, b] = best;
+      // палитра TWC: зелёный→жёлтый→оранжевый→красный→малиновый
+      if (r > 170 && b > 120) intensity = 'heavy';          // малиновый (экстрим)
+      else if (r > 180 && g < 150) intensity = 'heavy';     // красный
+      else if (r > 170 && g > 150) intensity = 'moderate';  // жёлто-оранжевый
+      else intensity = 'light';                              // зелёный/синий
+    }
+    return { precip, intensity, time: frame.time };
+  }
+
+  // Индикатор «сейчас по радару» — отдельно от прогнозной таблицы.
+  async function renderRadarNow() {
+    const strip = $('#radar-now');
+    if (!strip) return;
+    if (!state.city) { strip.hidden = true; return; }
+
+    const { latitude, longitude } = state.city;
+
+    // тип осадков (дождь/снег) прикинем по консенсусной температуре
+    const currents = activeProviders().map(p => state.data[p.id]?.current).filter(Boolean);
+    const tempAvg = median(currents.map(c => c.temp));
+
+    try {
+      const res = await sampleRadar(latitude, longitude);
+      const ts = new Date(res.time * 1000);
+      const hhmm = `${String(ts.getHours()).padStart(2, '0')}:${String(ts.getMinutes()).padStart(2, '0')}`;
+
+      if (!res.precip) {
+        strip.className = 'radar-strip radar-dry';
+        strip.innerHTML = `
+          <span class="radar-dot"></span>
+          <span class="radar-text">По радару сейчас осадков нет</span>
+          <span class="radar-meta">наблюдение · ${hhmm}</span>`;
+        strip.hidden = false;
+        return;
+      }
+
+      // дождь / мокрый снег / снег
+      let type = 'дождь', icon = '🌧';
+      if (tempAvg != null && tempAvg <= 0) { type = 'снег'; icon = '🌨'; }
+      else if (tempAvg != null && tempAvg <= 2) { type = 'мокрый снег'; icon = '🌨'; }
+
+      const intWord = res.intensity === 'heavy' ? 'сильный '
+        : res.intensity === 'light' ? 'небольшой ' : '';
+      // согласование: «небольшой дождь», но «небольшой снег»; для «мокрый снег» префикс не клеим
+      const label = (type === 'мокрый снег') ? type : `${intWord}${type}`;
+
+      strip.className = 'radar-strip radar-wet';
+      strip.innerHTML = `
+        <span class="radar-ico">${icon}</span>
+        <span class="radar-text">По радару сейчас идёт ${escapeHtml(label)}</span>
+        <span class="radar-meta">наблюдение · ${hhmm}</span>`;
+      strip.hidden = false;
+    } catch (e) {
+      // радар недоступен (нет CORS / нет покрытия) — не показываем строку
+      console.warn('radar nowcast unavailable:', e);
+      strip.hidden = true;
+    }
+  }
+
+  async function renderMap() {
     const el = $('#map-wrap');
     if (!state.city) {
       el.innerHTML = `<div class="map-fallback">Выберите город, чтобы увидеть карту осадков.</div>`;
       return;
     }
-    const { latitude, longitude } = state.city;
-    const yandexUrl = `https://yandex.ru/pogoda/maps/nowcast?lat=${latitude}&lon=${longitude}&z=9`;
-    // Windy embed: overlay=radar (рекомендуется для движения осадков)
-    const windyUrl = `https://embed.windy.com/embed2.html?lat=${latitude}&lon=${longitude}&zoom=8&level=surface&overlay=radar&product=radar&menu=&message=true&marker=true&calendar=&pressure=&type=map&location=coordinates&detail=&metricWind=m%2Fs&metricTemp=%C2%B0C&radarRange=-1`;
+    if (typeof L === 'undefined') {
+      el.innerHTML = `<div class="map-fallback">Не удалось загрузить библиотеку карт. Проверьте интернет.</div>`;
+      return;
+    }
 
-    el.innerHTML = `
-      <iframe src="${windyUrl}" loading="lazy" title="Windy radar"></iframe>
-      <div style="position:absolute; bottom:10px; right:10px; display:flex; gap:8px;">
-        <a class="map-fallback-link" href="${yandexUrl}" target="_blank" rel="noopener"
-           style="padding:8px 14px;background:rgba(20,23,28,0.92);border:1px solid var(--line);border-radius:6px;color:var(--text);font-size:12px;text-decoration:none;backdrop-filter:blur(6px);">
-          Открыть Яндекс Nowcast →
-        </a>
-      </div>
-    `;
+    const { latitude, longitude } = state.city;
+
+    // (пере)создаём карту полностью при смене города
+    el.innerHTML = `<div id="rv-map"></div>`;
+
+    const map = L.map('rv-map', {
+      center: [latitude, longitude],
+      zoom: 8,
+      zoomControl: true,
+      attributionControl: true,
+    });
+    state.rvMap = map;
+
+    // тёмная подложка — CARTO Dark Matter (бесплатный и без ключа)
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap, © CARTO',
+      subdomains: 'abcd',
+      maxZoom: 19,
+    }).addTo(map);
+
+    // маркер города
+    L.marker([latitude, longitude]).addTo(map)
+      .bindPopup(state.city.name).openPopup();
+
+    // RainViewer текущий слой
+    try {
+      const data = await getRainViewerIndex();
+      // берём самый свежий доступный кадр
+      const past = (data.radar?.past || []);
+      const nowcast = (data.radar?.nowcast || []);
+      const latest = nowcast[0] || past[past.length - 1];
+      if (!latest) throw new Error('no frames');
+
+      const host = data.host;
+      // colorScheme=2 — стандартная (Original), size=512, snow=1
+      const layerUrl = `${host}${latest.path}/512/{z}/{x}/{y}/2/1_1.png`;
+      const rvLayer = L.tileLayer(layerUrl, {
+        opacity: 0.7,
+        attribution: '© RainViewer',
+        maxZoom: 12,
+      }).addTo(map);
+      state.rvLayer = rvLayer;
+
+      // легенда
+      const legend = L.control({ position: 'bottomleft' });
+      legend.onAdd = function () {
+        const div = L.DomUtil.create('div', 'rv-legend');
+        const ts = new Date(latest.time * 1000);
+        const hh = String(ts.getHours()).padStart(2, '0');
+        const mm = String(ts.getMinutes()).padStart(2, '0');
+        div.innerHTML = `
+          <div class="rv-legend-time">RainViewer · ${hh}:${mm}</div>
+          <div class="rv-legend-bar">
+            <span style="background:#01a2ff"></span>
+            <span style="background:#00ff66"></span>
+            <span style="background:#ffe800"></span>
+            <span style="background:#ff8000"></span>
+            <span style="background:#ff0000"></span>
+            <span style="background:#a200ff"></span>
+          </div>
+          <div class="rv-legend-labels">
+            <span>лёгкий</span><span>средний</span><span>сильный</span>
+          </div>
+        `;
+        return div;
+      };
+      legend.addTo(map);
+    } catch (err) {
+      console.warn('RainViewer load failed:', err);
+      const warn = L.control({ position: 'topright' });
+      warn.onAdd = function () {
+        const d = L.DomUtil.create('div', 'rv-warn');
+        d.textContent = 'Слой осадков недоступен';
+        return d;
+      };
+      warn.addTo(map);
+    }
   }
 
   // ---- settings panel ---------------------------------------------------
@@ -592,7 +978,6 @@
   });
 
   function renderPanel() {
-    // model toggles
     const togglesHtml = PROVIDERS
       .filter(p => !p.requiresKey)
       .map(p => {
@@ -645,33 +1030,25 @@
   if (state.city) {
     loadAllAndRender();
   } else {
-    // первый запуск: пробуем взять координаты браузера
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(async (pos) => {
         try {
           const { latitude, longitude } = pos.coords;
-          // обратное геокодирование через Open-Meteo
           const url = `https://geocoding-api.open-meteo.com/v1/reverse?latitude=${latitude}&longitude=${longitude}&language=ru&format=json`;
           const r = await fetch(url);
           if (r.ok) {
             const j = await r.json();
             const top = (j.results && j.results[0]) || null;
-            if (top) {
-              pickCity(top);
-              return;
-            }
+            if (top) { pickCity(top); return; }
           }
-          // fallback: создаём минимальную city из координат
           state.city = {
             name: `${latitude.toFixed(2)}, ${longitude.toFixed(2)}`,
-            country: '',
-            country_code: '',
-            latitude, longitude,
+            country: '', country_code: '', latitude, longitude,
           };
           saveState();
           loadAllAndRender();
-        } catch (e) { /* user can search manually */ }
-      }, () => { /* denied — user will search manually */ }, { timeout: 5000 });
+        } catch (e) { /* ignore */ }
+      }, () => { /* denied */ }, { timeout: 5000 });
     }
   }
 

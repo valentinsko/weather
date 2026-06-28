@@ -10,7 +10,14 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Albert+Sans:wght@300..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet" />
 
-<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+  crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+  crossorigin=""></script>
+
+<link rel="stylesheet" href="styles.css?v=3" />
 </head>
 <body>
 
@@ -42,15 +49,19 @@
     <div class="hero-loc">
       <h1 id="loc-name">—</h1>
       <p id="loc-meta">выберите город, чтобы загрузить прогнозы</p>
+      <div id="radar-badge" class="radar-badge" hidden></div>
     </div>
     <div class="hero-now" id="hero-now"></div>
   </section>
+
+  <!-- РАДАР: что прямо сейчас (наблюдение) -->
+  <div class="radar-strip" id="radar-now" hidden></div>
 
   <!-- ТЕКУЩАЯ ПОГОДА: сравнение источников -->
   <section class="block">
     <div class="block-head">
       <h2>Сейчас <span class="block-sub">— сравнение источников</span></h2>
-      <p class="block-help">Каждая колонка — независимая метеомодель или сервис. «Среднее» — медиана по доступным значениям.</p>
+      <p class="block-help">Каждая колонка — независимая <b>прогнозная модель</b> или сервис; значения рассчитаны, а не измерены. «Среднее» — медиана. Фактический дождь в моменте смотрите по индикатору радара выше и на карте внизу.</p>
     </div>
     <div class="table-scroll">
       <table class="t" id="table-now"></table>
@@ -79,11 +90,11 @@
     </div>
   </section>
 
-  <!-- КАРТА ОСАДКОВ ЯНДЕКСА -->
+  <!-- КАРТА ОСАДКОВ -->
   <section class="block block--map">
     <div class="block-head">
-      <h2>Карта движения осадков <span class="block-sub">— Яндекс Nowcast</span></h2>
-      <p class="block-help">Прогноз радара от Яндекса. Если виджет не загрузился — откроется по ссылке.</p>
+      <h2>Карта осадков <span class="block-sub">— RainViewer (глобально)</span></h2>
+      <p class="block-help">Композит наземных радаров и спутниковых данных. Покрытие глобальное, включая Россию. Свежий слой обновляется каждые 10 минут.</p>
     </div>
     <div class="map-wrap" id="map-wrap"></div>
   </section>
@@ -91,8 +102,8 @@
   <footer class="foot">
     <p>
       Источники: Open-Meteo (модели ECMWF, ICON-DWD, GFS, Météo-France, GEM, JMA),
-      OpenWeatherMap, WeatherAPI, MET Norway.
-      Карта осадков — yandex.ru/pogoda/maps/nowcast.
+      OpenWeatherMap, WeatherAPI.
+      Карта осадков — RainViewer · подложка CARTO + OpenStreetMap.
     </p>
     <p class="foot-mute">
       Open source · MIT · <a href="https://github.com/" target="_blank" rel="noopener">github</a>
@@ -157,7 +168,7 @@
 
 <div id="toast" class="toast" hidden></div>
 
-<script src="providers.js"></script>
-<script src="app.js"></script>
+<script src="providers.js?v=3"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>
