@@ -333,18 +333,46 @@
 
     state.data = {};
     const providers = activeProviders();
+    const omProviders = providers.filter(p => p.kind === 'open-meteo');
+    const otherProviders = providers.filter(p => p.kind !== 'open-meteo');
 
-    await Promise.all(providers.map(async (p) => {
-      try {
-        const opts = {};
-        if (p.id === 'owm') opts.apiKey = state.keys.owm;
-        if (p.id === 'wapi') opts.apiKey = state.keys.wapi;
-        state.data[p.id] = await p.fetch(latitude, longitude, opts);
-      } catch (e) {
-        console.warn(`[${p.id}] failed:`, e);
-        state.data[p.id] = { error: String(e.message || e) };
-      }
-    }));
+    const tasks = [];
+
+    // Open-Meteo — ВСЕ модели одним запросом (вместо 6–7 отдельных)
+    if (omProviders.length) {
+      tasks.push((async () => {
+        try {
+          const batch = await window.METEUM_OM.fetchOpenMeteoBatch(
+            latitude, longitude,
+            omProviders.map(p => ({ id: p.id, model: p.model }))
+          );
+          for (const p of omProviders) {
+            const d = batch[p.id];
+            state.data[p.id] = (d && (d.hourly?.length || d.current)) ? d : { error: 'no data' };
+          }
+        } catch (e) {
+          console.warn('[open-meteo batch] failed:', e);
+          for (const p of omProviders) state.data[p.id] = { error: String(e.message || e) };
+        }
+      })());
+    }
+
+    // Источники с ключами — каждый своим запросом
+    for (const p of otherProviders) {
+      tasks.push((async () => {
+        try {
+          const opts = {};
+          if (p.id === 'owm') opts.apiKey = state.keys.owm;
+          if (p.id === 'wapi') opts.apiKey = state.keys.wapi;
+          state.data[p.id] = await p.fetch(latitude, longitude, opts);
+        } catch (e) {
+          console.warn(`[${p.id}] failed:`, e);
+          state.data[p.id] = { error: String(e.message || e) };
+        }
+      })());
+    }
+
+    await Promise.all(tasks);
 
     renderHero();
     renderTables();

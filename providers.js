@@ -195,77 +195,115 @@
     return a;
   }
 
-  // ---- Open-Meteo factory ----------------------------------------------
+  // ---- Open-Meteo: ОДИН запрос на все модели ----------------------------
+  // Раньше каждая модель = отдельный HTTP-запрос (6–7 за загрузку), что
+  // быстро упиралось в лимит api.open-meteo.com. Теперь все модели идут
+  // одним запросом: models=a,b,c → переменные с суффиксом _<model>.
 
+  const OM_CURRENT = 'temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation,weather_code,is_day';
+  const OM_HOURLY  = 'temperature_2m,apparent_temperature,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation,weather_code,is_day';
+  const OM_DAILY   = 'temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,wind_speed_10m_max,wind_direction_10m_dominant,weather_code';
+
+  // достаёт ключ с суффиксом модели, с откатом на «голый» ключ (когда модель одна)
+  function pick(obj, base, model) {
+    if (!obj) return undefined;
+    const suff = obj[`${base}_${model}`];
+    return suff !== undefined ? suff : obj[base];
+  }
+
+  // Разбор одной модели из общего ответа
+  function parseOpenMeteoModel(j, model) {
+    const C = j.current;
+    let current = null;
+    if (C) {
+      const t = pick(C, 'temperature_2m', model);
+      if (t !== undefined && t !== null) {
+        const cw = wmoToKind(pick(C, 'weather_code', model));
+        current = {
+          temp: t,
+          feels_like: pick(C, 'apparent_temperature', model),
+          pressure: pick(C, 'pressure_msl', model),
+          wind_speed: pick(C, 'wind_speed_10m', model),
+          wind_direction: pick(C, 'wind_direction_10m', model),
+          precipitation: pick(C, 'precipitation', model),
+          humidity: pick(C, 'relative_humidity_2m', model),
+          weather_kind: cw.kind,
+          severity: cw.severity,
+          is_day: pick(C, 'is_day', model) === 1,
+        };
+      }
+    }
+
+    const H = j.hourly;
+    const hTemp = H ? pick(H, 'temperature_2m', model) : null;
+    const hourly = (H && H.time && Array.isArray(hTemp)) ? H.time.map((t, i) => {
+      const w = wmoToKind(pick(H, 'weather_code', model)?.[i]);
+      return {
+        time: t,
+        temp: pick(H, 'temperature_2m', model)?.[i],
+        feels_like: pick(H, 'apparent_temperature', model)?.[i],
+        pressure: pick(H, 'pressure_msl', model)?.[i],
+        wind_speed: pick(H, 'wind_speed_10m', model)?.[i],
+        wind_direction: pick(H, 'wind_direction_10m', model)?.[i],
+        precipitation: pick(H, 'precipitation', model)?.[i],
+        weather_kind: w.kind,
+        severity: w.severity,
+        is_day: pick(H, 'is_day', model)?.[i] === 1,
+      };
+    }).filter(x => x.temp != null) : [];
+
+    const D = j.daily;
+    const dMax = D ? pick(D, 'temperature_2m_max', model) : null;
+    const daily = (D && D.time && Array.isArray(dMax)) ? D.time.map((d, i) => {
+      const w = wmoToKind(pick(D, 'weather_code', model)?.[i]);
+      return {
+        date: d,
+        temp_max: pick(D, 'temperature_2m_max', model)?.[i],
+        temp_min: pick(D, 'temperature_2m_min', model)?.[i],
+        feels_like_max: pick(D, 'apparent_temperature_max', model)?.[i],
+        feels_like_min: pick(D, 'apparent_temperature_min', model)?.[i],
+        precipitation_sum: pick(D, 'precipitation_sum', model)?.[i],
+        wind_speed_max: pick(D, 'wind_speed_10m_max', model)?.[i],
+        wind_direction_dominant: pick(D, 'wind_direction_10m_dominant', model)?.[i],
+        weather_kind: w.kind,
+        severity: w.severity,
+      };
+    }).filter(x => x.temp_max != null) : [];
+
+    return { current, hourly, daily };
+  }
+
+  // Батч: models = [{ id, model }] → { [id]: {current,hourly,daily} }
+  async function fetchOpenMeteoBatch(lat, lon, models) {
+    if (!models.length) return {};
+    const params = new URLSearchParams({
+      latitude: lat,
+      longitude: lon,
+      current: OM_CURRENT,
+      hourly: OM_HOURLY,
+      daily: OM_DAILY,
+      timezone: 'auto',
+      forecast_days: 7,
+      wind_speed_unit: 'ms',
+      models: models.map(m => m.model).join(','),
+    });
+    const j = await safeJson(`https://api.open-meteo.com/v1/forecast?${params}`);
+    const out = {};
+    for (const m of models) out[m.id] = parseOpenMeteoModel(j, m.model);
+    return out;
+  }
+
+  // Лёгкий дескриптор модели (без собственного .fetch — данные тянет батч)
   function openMeteoFactory({ id, name, region, model }) {
     return {
-      id, name, region,
+      id, name, region, model,
       kind: 'open-meteo',
       requiresKey: false,
       enabledByDefault: true,
+      // одиночный fetch как запасной путь (тот же батч на одну модель)
       async fetch(lat, lon) {
-        const params = new URLSearchParams({
-          latitude: lat,
-          longitude: lon,
-          current: 'temperature_2m,apparent_temperature,relative_humidity_2m,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation,weather_code,is_day',
-          hourly:  'temperature_2m,apparent_temperature,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation,weather_code,is_day',
-          daily:   'temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,wind_speed_10m_max,wind_direction_10m_dominant,weather_code',
-          timezone: 'auto',
-          forecast_days: 7,
-          wind_speed_unit: 'ms',
-        });
-        if (model) params.set('models', model);
-        const url = `https://api.open-meteo.com/v1/forecast?${params}`;
-        const j = await safeJson(url);
-
-        const c = j.current || {};
-        const cw = wmoToKind(c.weather_code);
-        const current = j.current ? {
-          temp: c.temperature_2m,
-          feels_like: c.apparent_temperature,
-          pressure: c.pressure_msl,
-          wind_speed: c.wind_speed_10m,
-          wind_direction: c.wind_direction_10m,
-          precipitation: c.precipitation,
-          humidity: c.relative_humidity_2m,
-          weather_kind: cw.kind,
-          severity: cw.severity,
-          is_day: c.is_day === 1,
-        } : null;
-
-        const hourly = (j.hourly && j.hourly.time) ? j.hourly.time.map((t, i) => {
-          const w = wmoToKind(j.hourly.weather_code?.[i]);
-          return {
-            time: t,
-            temp: j.hourly.temperature_2m?.[i],
-            feels_like: j.hourly.apparent_temperature?.[i],
-            pressure: j.hourly.pressure_msl?.[i],
-            wind_speed: j.hourly.wind_speed_10m?.[i],
-            wind_direction: j.hourly.wind_direction_10m?.[i],
-            precipitation: j.hourly.precipitation?.[i],
-            weather_kind: w.kind,
-            severity: w.severity,
-            is_day: j.hourly.is_day?.[i] === 1,
-          };
-        }) : [];
-
-        const daily = (j.daily && j.daily.time) ? j.daily.time.map((d, i) => {
-          const w = wmoToKind(j.daily.weather_code?.[i]);
-          return {
-            date: d,
-            temp_max: j.daily.temperature_2m_max?.[i],
-            temp_min: j.daily.temperature_2m_min?.[i],
-            feels_like_max: j.daily.apparent_temperature_max?.[i],
-            feels_like_min: j.daily.apparent_temperature_min?.[i],
-            precipitation_sum: j.daily.precipitation_sum?.[i],
-            wind_speed_max: j.daily.wind_speed_10m_max?.[i],
-            wind_direction_dominant: j.daily.wind_direction_10m_dominant?.[i],
-            weather_kind: w.kind,
-            severity: w.severity,
-          };
-        }) : [];
-
-        return { current, hourly, daily };
+        const batch = await fetchOpenMeteoBatch(lat, lon, [{ id, model }]);
+        return batch[id];
       },
     };
   }
@@ -426,12 +464,13 @@
     openMeteoFactory({ id: 'om_arpege', name: 'ARPEGE',    region: 'FR · Météo-France', model: 'meteofrance_seamless' }),
     openMeteoFactory({ id: 'om_gem',    name: 'GEM',       region: 'CA · ECCC',         model: 'gem_seamless' }),
     openMeteoFactory({ id: 'om_jma',    name: 'JMA',       region: 'JP · 気象庁',         model: 'jma_seamless' }),
-    openMeteoFactory({ id: 'om_best',   name: 'Open-Meteo', region: 'best-match',        model: '' }),
+    openMeteoFactory({ id: 'om_best',   name: 'Open-Meteo', region: 'best-match',        model: 'best_match' }),
     OWM,
     WAPI,
   ];
 
   global.METEUM_PROVIDERS = PROVIDERS;
   global.METEUM_UTIL = { circularMean, severityRank };
+  global.METEUM_OM = { fetchOpenMeteoBatch };
 
 })(window);
