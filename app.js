@@ -341,18 +341,35 @@
     // Open-Meteo — ВСЕ модели одним запросом (вместо 6–7 отдельных)
     if (omProviders.length) {
       tasks.push((async () => {
-        try {
-          const batch = await window.METEUM_OM.fetchOpenMeteoBatch(
-            latitude, longitude,
-            omProviders.map(p => ({ id: p.id, model: p.model }))
-          );
+        let batch = null;
+        const omApi = window.METEUM_OM && window.METEUM_OM.fetchOpenMeteoBatch;
+        if (omApi) {
+          try {
+            batch = await omApi(
+              latitude, longitude,
+              omProviders.map(p => ({ id: p.id, model: p.model }))
+            );
+          } catch (e) {
+            console.warn('[open-meteo batch] failed -> fallback:', e.message);
+            state._omError = e.message;
+          }
+        }
+        if (batch) {
           for (const p of omProviders) {
             const d = batch[p.id];
             state.data[p.id] = (d && (d.hourly?.length || d.current)) ? d : { error: 'no data' };
           }
-        } catch (e) {
-          console.warn('[open-meteo batch] failed:', e);
-          for (const p of omProviders) state.data[p.id] = { error: String(e.message || e) };
+        } else {
+          // запасной путь: каждая модель отдельным запросом — одна битая
+          // модель не гасит остальные, ошибка фиксируется по отдельности
+          await Promise.all(omProviders.map(async (p) => {
+            try {
+              state.data[p.id] = await p.fetch(latitude, longitude);
+            } catch (e) {
+              console.warn(`[${p.id}] failed:`, e.message);
+              state.data[p.id] = { error: String(e.message || e) };
+            }
+          }));
         }
       })());
     }
@@ -378,14 +395,19 @@
     renderTables();
     renderRadarNow();
 
-    // если ВСЕ источники отвалились — не оставляем немую пустоту
+    // если ВСЕ источники отвалились — показываем реальную причину
     const okCount = providers.filter(p => state.data[p.id] && !state.data[p.id].error).length;
     if (providers.length && okCount === 0) {
-      toast('Не удалось загрузить данные ни из одного источника. Возможно, временный сбой сети или превышен лимит запросов — попробуйте обновить через минуту.', 'error');
+      const firstErr = state._omError
+        || providers.map(p => state.data[p.id]?.error).find(Boolean)
+        || '';
+      const detail = firstErr ? ` Причина: ${firstErr}.` : '';
+      toast(`Не удалось загрузить данные ни из одного источника.${detail} Попробуйте обновить через минуту.`, 'error');
     } else if (okCount < providers.length) {
       const failed = providers.length - okCount;
       console.warn(`${failed} из ${providers.length} источников не ответили`);
     }
+    state._omError = null;
   }
 
   // ---- rendering: hero --------------------------------------------------

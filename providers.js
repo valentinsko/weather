@@ -33,7 +33,15 @@
     const tid = setTimeout(() => ctrl.abort(), 15000);
     try {
       const res = await fetch(url, { ...opts, signal: ctrl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        // Open-Meteo при 400 отдаёт { error:true, reason:"..." } — достаём причину
+        let reason = `HTTP ${res.status}`;
+        try {
+          const body = await res.clone().json();
+          if (body && body.reason) reason = body.reason;
+        } catch (e) { /* тело не JSON — оставляем код */ }
+        throw new Error(reason);
+      }
       return await res.json();
     } finally {
       clearTimeout(tid);
